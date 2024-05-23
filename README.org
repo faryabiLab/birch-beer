@@ -2,7 +2,7 @@
 #+AUTHOR: Gregory W. Schwartz
 #+OPTIONS: date:nil creator:nil timestamp:nil toc:t
 
-#+SETUPFILE: https://fniessen.github.io/org-html-themes/setup/theme-readtheorg.setup
+#+SETUPFILE: https://fniessen.github.io/org-html-themes/org/theme-readtheorg.setup
 
 [[https://gregoryschwartz.github.io/birch-beer/][Website]]
 
@@ -19,6 +19,22 @@ blending, distance markers, and more, we can all create some home brewed
 =birch-beer= together!
 
 * Installation
+
+** Use =nix=
+
+Installing =birch-beer= using =nix= is the easiest way to install from source.
+First, install =nix= following the instructions
+[[https://nixos.org/nix/][on the website]]. Then run the commands:
+
+#+BEGIN_SRC sh
+git clone https://github.com/GregorySchwartz/birch-beer.git
+cd birch-beer
+nix-env -f default.nix -i birch-beer
+#+END_SRC
+
+Then the =birch-beer= command should be in your path! If you do not wish to use
+=nix= or =docker=, then you can continue reading for dependencies and =stack=
+installation (no longer supported).
 
 ** Dependencies
 
@@ -107,21 +123,63 @@ docker build -t birch-beer -f ./Dockerfile .
 single cell clades with examples. At any point, use =birch-beer -h= to see the
 help. The general usage would be:
 
-#+BEGIN_SRC sh
+#+BEGIN_SRC bash
 birch-beer --input tree.json --labels-file labels.csv
 #+END_SRC
 
 ** Tree format
 
 The input tree format should be a =json= file with a recursive structure. An
-object is represented by
-=[{"_distance": DOUBLE, "_item": [STRING]}, [SUBFOREST]]=, where ="_distance"=
-and ="_item"= are optional, usually, having ="_distance"= for inner nodes and
-="_item"= for leaves. Supports rose trees as well! For example:
+object is represented by =[{"_distance": DOUBLE, "_item": [STRING]},
+[SUBFOREST]]=, where ="_distance"= and ="_item"= are optional (otherwise use
+={}=), having ="_distance"= for inner nodes and ="_item"= for leaves. Supports
+rose trees as well! For example:
 
 #+BEGIN_EXAMPLE
 [{"_distance": 0.8}, [[{"_item": ["1", "2"]}, [[{"_item": ["3", "4", "5"]}, []], [{"_item": ["6", "7"]}, []]]], [{"_item": ["8", "9", "10", "11"]}, []]]]
 #+END_EXAMPLE
+
+*** Example conversion from R
+
+To get to the required format, here is an example to get from an R =hclust= tree
+to the appropriate =json=.
+
+#+BEGIN_SRC R
+library(dendextend)
+library(data.tree)
+library(jsonlite)
+
+# Get hclust tree.
+hc = hclust(dist(USArrests), "ave")
+# Get dendrogram.
+dend = as.dendrogram(hc)
+# Get nicely formatted tree from dendrogram.
+tree = as.Node(dend)
+# Convert to JSON
+json = toJSON(as.list(tree, mode = "explicit", unname = TRUE))
+# Write to file
+cat(json, file = "tree.json")
+#+END_SRC
+
+Saving this file as =tree.json=, we continue to format as such (this could be a
+single command, but was split to make clearer). Here, we use
+[[https://stedolan.github.io/jq/][ =jq= ]], the command line =json= processor.
+
+#+BEGIN_SRC bash
+cat tree.json \
+    | jq -c 'walk( if (type == "object") then (if (has("leaf") | not) then del(.name) else . end) else . end)' \
+    | jq -c 'walk( if (type == "object") then del(.members) | del(.midpoint) | del(.value) | del(.plotHeight) else . end)' \
+    | jq -c 'walk( if (type == "object") then (if (has("leaf")) then ._item = .name | del(.name) else . end) else . end)' \
+    | jq -c 'walk( if (type == "object") then (if (has("leaf") | not) then [{}, [.children[]]] else . end) else . end)' \
+    | jq -c 'walk( if (type == "object") then (if (has("leaf")) then [{_item}, []] else . end) else . end)' \
+    > formatted_tree.json
+#+END_SRC
+
+Then we can see the tree using birch-beer.
+
+#+BEGIN_SRC bash
+birch-beer -i formatted_tree.json
+#+END_SRC
 
 ** Labels format
 

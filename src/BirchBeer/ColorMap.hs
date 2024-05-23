@@ -14,9 +14,13 @@ module BirchBeer.ColorMap
     , getLabelColorMap
     , getLabelCustomColorMap
     , getLabelMapThresholdContinuous
+    , getLabelMapProximity
     , labelToItemColorMap
     , getItemColorMapContinuous
+    , getItemValueMap
     , getItemColorMapSumContinuous
+    , getItemValueMapSum
+    , getCombinedFeatures
     , getMarkColorMap
     , getNodeColorMapFromItems
     , getNodeColorMapFromDiversity
@@ -26,6 +30,8 @@ module BirchBeer.ColorMap
     , saturateNodeColorMap
     , saturateItemColorMap
     , saturateLabelColorMap
+    , getDiscreteColorMap
+    , discretizeColorMap
     ) where
 
 -- Remote
@@ -35,9 +41,10 @@ import Data.Colour (AffineSpace (..), withOpacity, blend)
 import Data.Colour.Names (black)
 import Data.Colour.RGBSpace.HSV (hsv, hsvView)
 import Data.Colour.Palette.ColorSet (rybColor)
+import Data.Foldable (foldl')
 import Data.Function (on)
 import Data.Int (Int32)
-import Data.Maybe (fromMaybe, isNothing)
+import Data.Maybe (fromMaybe, isNothing, mapMaybe)
 import Data.Tuple (swap)
 import Diagrams.Prelude
 import Math.Diversity.Diversity (diversity)
@@ -116,6 +123,11 @@ getLabelColorMap Set1 (LabelMap lm) =
   where
     colors = interpColors (Set.size labels) $ Brewer.brewerSet Brewer.Set1 9
     labels = Set.fromList . Map.elems $ lm
+getLabelColorMap Blues (LabelMap lm) =
+    LabelColorMap . Map.fromList . flip zip colors . Set.toAscList $ labels
+  where
+    colors = interpColors (Set.size labels) . drop 1 $ Brewer.brewerSet Brewer.Blues 9  -- First color too close to white
+    labels = Set.fromList . Map.elems $ lm
 getLabelColorMap Ryb (LabelMap lm) =
     LabelColorMap . Map.fromList . flip zip colors . Set.toAscList $ labels
   where
@@ -187,34 +199,64 @@ getContinuousColor highColor lowColor =
   where
     getExist = fromMaybe (error "Feature does not exist or no cells found.")
 
--- | Get the colors of each item, where the color is determined by features.
+-- | Get the colors of each item, where the color is determined by the average
+-- of features.
 getItemColorMapContinuous
     :: (MatrixLike a)
-    => Maybe CustomColors -> Feature -> a -> ItemColorMap
-getItemColorMapContinuous customColors g mat
-    | isNothing col = ItemColorMap Map.empty
-    | otherwise = ItemColorMap
-                . Map.fromList
-                . zip (fmap Id . V.toList . getRowNames $ mat)
-                . getContinuousColor highColor lowColor
-                . S.toDenseListSV
-                . flip S.extractCol (colErr col)
-                . getMatrix
-                $ mat
+    => Maybe CustomColors -> [Feature] -> a -> Either String ItemColorMap
+getItemColorMapContinuous customColors gs mat =
+  fmap ( ItemColorMap
+       . Map.fromList
+       . zip (fmap Id . V.toList . getRowNames $ mat)
+       . getContinuousColor highColor lowColor
+       )
+    . getCombinedFeatures gs
+    $ mat
   where
-    colErr = fromMaybe (error $ "Feature " <> T.unpack (unFeature g) <> " does not exist.")
-    col = V.elemIndex g
-        . fmap Feature
-        . getColNames
-        $ mat
     (highColor, lowColor) = getHighLowColors customColors
+
+-- | Get the values of each item, where the value is determined by the average
+-- of features.
+getItemValueMap
+    :: (MatrixLike a) => [Feature] -> a -> Either String ItemValueMap
+getItemValueMap gs mat =
+  fmap ( ItemValueMap
+       . Map.fromList
+       . zip (fmap Id . V.toList . getRowNames $ mat)
+       )
+    . getCombinedFeatures gs
+    $ mat
+
+-- | For items with several needed features, combine together by averages.
+getCombinedFeatures :: (MatrixLike a)
+                    => [Feature]
+                    -> a
+                    -> Either String [Double]
+getCombinedFeatures gs mat
+    | V.length cols < truncate n = Left
+                        $ "One of the features in "
+                       <> (show . fmap unFeature $ gs)
+                       <> " does not exist."
+    | otherwise = Right
+                . fmap ((/ n) . foldl' (+) 0)
+                . S.toRowsL
+                . S.fromColsV
+                . fmap (S.extractCol (getMatrix mat))
+                $ cols
+  where
+    cols = V.findIndices (flip Set.member gsSet)
+         . fmap Feature
+         . getColNames
+         $ mat
+    gsSet = Set.fromList gs
+    n = fromIntegral $ Set.size gsSet
 
 -- | Get the labels of each item, where the label is determined by a binary high
 -- / low features determined by a threshold. Multiple features can be used
 -- for combinatorical labeling, but only reports those present in the data set.
 getLabelMapThresholdContinuous
     :: (MatrixLike a)
-    => [(Feature, Double)] -> a -> LabelMap
+    => [(Feature, Threshold)] -> a -> LabelMap
 getLabelMapThresholdContinuous gs mat
     | any (isNothing . getCol . fst) gs = LabelMap Map.empty
     | otherwise = LabelMap
@@ -223,17 +265,20 @@ getLabelMapThresholdContinuous gs mat
                 . getCutoffLabels
                 $ gs'
   where
-    getCutoffLabels :: [(Feature, Double)] -> [Label]
+    getCutoffLabels :: [(Feature, Threshold)] -> [Label]
     getCutoffLabels =
         fmap (Label . List.foldl1' (\acc x -> acc <> " " <> x))
             . List.transpose
             . fmap (uncurry getCutoffLabelFeature)
     getCutoffLabelFeature g v =
-        fmap (\x -> unFeature g <> " " <> if x > v then "high" else "low")
+        (\(!xs, !v') -> fmap (\x -> unFeature g <> " " <> if x > v' then "high" else "low") xs)
+            . (\xs -> (xs, fromThreshold v $ V.fromList xs))
             . S.toDenseListSV
             . flip S.extractCol (colErr g $ getCol g)
             . getMatrix
             $ mat
+    fromThreshold (Exact x) _ = x
+    fromThreshold (MadMedian x) xs = smartValue x xs
     gs' = List.sortBy (compare `on` fst) gs
     colErr g = fromMaybe (error $ "Feature " <> T.unpack (unFeature g) <> " does not exist.")
     getCol g = V.elemIndex g
@@ -241,32 +286,79 @@ getLabelMapThresholdContinuous gs mat
              . getColNames
              $ mat
 
+-- | Get the spatial neighbor labels of each item, where the label is determined
+-- by the proximity (Euclidean distance) of the items from a collection of nodes.
+getLabelMapProximity
+  :: (TreeItem a)
+  => ClusterGraph a -> CoordinateMap -> ([G.Node], Double) -> LabelMap
+getLabelMapProximity (ClusterGraph gr) (CoordinateMap coordm) (!nodes, !thresh) =
+  LabelMap
+    . Map.fromList
+    . fmap (\ (!x, (!s1, _)) -> (x, assignLabel (s1, x)))
+    . Map.toAscList
+    $ coordm
+  where
+    baseLocations = mapMaybe (flip Map.lookup coordm) . Set.toList $ baseItems
+    baseItems :: Set.Set Id
+    baseItems = Set.fromList
+              . fmap getId
+              . F.toList
+              . mconcat
+              . mapMaybe snd
+              . F.toList
+              . mconcat
+              . fmap (getGraphLeaves gr)
+              $ nodes
+    assignLabel (!s1, !x)
+      | Set.member x baseItems = Label "Base"
+      | any (\(!s2, !v) -> s1 == s2 && v <= thresh)
+          . mapMaybe (\ b
+                     -> Map.lookup x coordm
+                    >>= \z -> Just (fst b, S.norm2 (snd b S.^-^ snd z))
+                     )
+          $ baseLocations = Label "Neighbor"
+      | otherwise = Label "Distant"
+
 -- | Get the colors of each item, where the color is determined by the sum of
--- features in that cell.
+-- features in that item.
 getItemColorMapSumContinuous :: (MatrixLike a) => Maybe CustomColors -> a -> ItemColorMap
 getItemColorMapSumContinuous customColors mat =
     ItemColorMap
         . Map.fromList
         . zip (fmap Id . V.toList . getRowNames $ mat)
         . getContinuousColor highColor lowColor
-        . fmap sum
+        . fmap (foldl' (+) 0)
         . S.toRowsL
         . getMatrix
         $ mat
   where
     (highColor, lowColor) = getHighLowColors customColors
 
+-- | Get the value of each item, where the value is determined by the sum of
+-- features in that item.
+getItemValueMapSum :: (MatrixLike a) => a -> ItemValueMap
+getItemValueMapSum mat =
+    ItemValueMap
+        . Map.fromList
+        . zip (fmap Id . V.toList . getRowNames $ mat)
+        . fmap (foldl' (+) 0)
+        . S.toRowsL
+        . getMatrix
+        $ mat
+
 -- | Use the outgoing edges of a node to define the mark around the node.
 -- Min max normalization.
-getMarkColorMap :: ClusterGraph a -> MarkColorMap
-getMarkColorMap g =
+getMarkColorMap :: DrawNodeMark -> ClusterGraph a -> MarkColorMap
+getMarkColorMap nm g =
     MarkColorMap . Map.map (withOpacity black) $ valMap
   where
     valMap   = Map.map (minMaxNorm minVal maxVal) . Map.fromList $ valAssoc
     minVal   = minimum . fmap snd $ valAssoc
     maxVal   = maximum . fmap snd $ valAssoc
     valAssoc = fmap nodeValue . G.labEdges . unClusterGraph $ g
-    nodeValue (n1, n2, v) = (n1, v)
+    nodeValue (n1, n2, v) = (n1, fromMaybe 0 $ L.view (valLens nm) v)
+    valLens MarkModularity = edgeDistance
+    valLens MarkSignificance = edgeSignificance
 
 -- | Get the node color map based on the labels of each item.
 getNodeColorMapFromItems
@@ -361,4 +453,29 @@ saturateItemColorMap x = ItemColorMap . fmap (saturateColor x) . unItemColorMap
 -- | Saturate the label color map by multiplying the saturation in the HSV model
 -- by a specified amount.
 saturateLabelColorMap :: DrawScaleSaturation -> LabelColorMap -> LabelColorMap
-saturateLabelColorMap x = LabelColorMap . fmap (saturateColor x) . unLabelColorMap
+saturateLabelColorMap x =
+  LabelColorMap . fmap (saturateColor x) . unLabelColorMap
+
+-- | Get the color map list from user input, either the list itself or a way to
+-- segment the current color scheme.
+getDiscreteColorMap :: DrawLeaf
+                    -> Maybe CustomColors
+                    -> Maybe LabelColorMap
+                    -> DrawDiscretize
+                    -> Maybe DiscreteColorMap
+getDiscreteColorMap DrawText _ _ _ = Nothing
+getDiscreteColorMap _ _ _ (CustomColorMap cs) = Just $ DiscreteColorMap cs
+getDiscreteColorMap (DrawItem DrawLabel) _ (Just (LabelColorMap cm)) (SegmentColorMap i) =
+  Just . DiscreteColorMap . (\xs -> if Set.size xs <= i then Set.toAscList xs else interpColors i . Set.toAscList $ xs) . Set.fromList . Map.elems $ cm
+getDiscreteColorMap (DrawItem (DrawThresholdContinuous _)) _ (Just (LabelColorMap cm)) (SegmentColorMap i) =
+  Just . DiscreteColorMap . (\xs -> if Set.size xs <= i then Set.toAscList xs else interpColors i . Set.toAscList $ xs) . Set.fromList . Map.elems $ cm
+getDiscreteColorMap _ customColors _ (SegmentColorMap i) =
+  Just . DiscreteColorMap $ interpColors i [lowColor, highColor]
+  where
+    (highColor, lowColor) = getHighLowColors customColors
+
+-- | Discretize color map by converting color to closest color in list.
+discretizeColorMap :: (Eq a, Ord a) => DiscreteColorMap
+                                    -> Map.Map a (Colour Double)
+                                    -> Map.Map a (Colour Double)
+discretizeColorMap (DiscreteColorMap cs) = fmap (closestColor cs)

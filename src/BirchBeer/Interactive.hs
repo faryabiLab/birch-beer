@@ -16,13 +16,14 @@ module BirchBeer.Interactive
 -- Remote
 import Data.Bool (bool)
 import Data.Colour.SRGB (sRGB24reads)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, fromMaybe)
 import Data.Tree (Tree (..))
 import Safe (headMay)
 import Text.Read (readMaybe)
 import System.IO.Temp (withTempFile)
 import qualified Control.Lens as L
 import qualified Data.Clustering.Hierarchical as HC
+import qualified Data.Set as Set
 import qualified Data.Text as T
 import qualified Data.Vector as V
 import qualified Diagrams.Backend.Cairo as D
@@ -55,12 +56,12 @@ interactiveDiagram tree labelMap mat simMat = graphicalUI' "birch-beer" $ do
                         DrawText
                         [ DrawItem DrawLabel
                         , DrawItem DrawSumContinuous
-                        , DrawItem (DrawContinuous "GENE")
+                        , DrawItem (DrawContinuous ["GENE"])
                         , DrawItem DrawDiversity
                         ]
-    drawContinuousGene' <- TS.entry "GENE for DrawItem DrawContinuous"
+    drawContinuousGene' <- TS.entry "[GENE] for DrawItem DrawContinuous"
     drawCollection' <-
-        TS.radioButton "Leaf shape" PieChart [PieRing, PieNone, CollectionGraph 1 0 []]
+        TS.radioButton "Leaf shape" PieChart [PieRing, IndividualItems, NoLeaf, Histogram, CollectionGraph 1 0 []]
     drawMark' <- TS.radioButton "Node mark" MarkNone [MarkModularity]
     drawPalette' <- TS.radioButton "Palette" Set1 [Hsv, Ryb]
     drawNodeNumber' <- fmap DrawNodeNumber $ TS.checkBox "Show node number"
@@ -90,18 +91,25 @@ interactiveDiagram tree labelMap mat simMat = graphicalUI' "birch-beer" $ do
     drawScaleSaturation' <-
         fmap (Just . DrawScaleSaturation)
             $ TS.spinButtonAt 1 "Saturate colors in the HSV model" 1
+    drawItemLineWeight' <-
+        fmap (Just . DrawItemLineWeight)
+            $ TS.spinButtonAt 0.1 "Line weight for item in collection" 1
 
     return $
         let drawLeaf' = case drawLeafTemp of
                             DrawItem (DrawContinuous _) ->
-                                DrawItem (DrawContinuous drawContinuousGene')
+                                DrawItem (DrawContinuous (fromMaybe [] $ readMaybe (T.unpack drawContinuousGene') :: [T.Text]))
                             x -> x
             config = Config { _birchLabelMap            = labelMap
                             , _birchMinSize             = Just minSize'
                             , _birchMaxStep             = Just maxStep'
                             , _birchMaxProportion       = Nothing
                             , _birchMinDistance         = Nothing
+                            , _birchMinDistanceSearch   = Nothing
                             , _birchSmartCutoff         = Nothing
+                            , _birchElbowCutoff         = Nothing
+                            , _birchCustomCut           = CustomCut Set.empty
+                            , _birchRootCut             = Nothing
                             , _birchOrder               = Nothing
                             , _birchDrawLeaf            = drawLeaf'
                             , _birchDrawCollection      = drawCollection'
@@ -114,7 +122,11 @@ interactiveDiagram tree labelMap mat simMat = graphicalUI' "birch-beer" $ do
                             , _birchDrawLegendAllLabels = DrawLegendAllLabels False
                             , _birchDrawPalette         = drawPalette'
                             , _birchDrawColors          = drawColors'
+                            , _birchDrawDiscretize      = Nothing
                             , _birchDrawScaleSaturation = drawScaleSaturation'
+                            , _birchDrawFont            = Nothing
+                            , _birchDrawItemLineWeight  = drawItemLineWeight'
+                            , _birchDrawBarBounds       = DrawBarBounds False
                             , _birchTree                = tree
                             , _birchMat                 = mat
                             , _birchSimMat              = simMat
@@ -125,9 +137,7 @@ interactiveDiagram tree labelMap mat simMat = graphicalUI' "birch-beer" $ do
 graphicalUI'
     :: T.Text
     -> TS.Updatable (IO (D.Diagram D.Cairo))
-    ->
-       -- ^ Program logic
-       IO ()
+    -> IO ()
 graphicalUI' = TS.ui setupGraphical processGraphicalEvent
   where
     setupGraphical :: Gtk.HBox -> IO Gtk.DrawingArea
@@ -164,9 +174,7 @@ graphicalUI' = TS.ui setupGraphical processGraphicalEvent
 graphicalUIPng'
     :: T.Text
     -> TS.Updatable (IO (D.Diagram D.Cairo))
-    ->
-       -- ^ Program logic
-       IO ()
+    -> IO ()
 graphicalUIPng' title updatable = withTempFile "." "temp_tree.png" $ \file h -> do
     TS.ui setupGraphical (processGraphicalEvent file h) title updatable
   where
